@@ -5,8 +5,9 @@
 
 Steps: the size (strata_control/inkling_catalog.py: the file, its pinned revision, size and SHA-256), the RAM plan (every
 expert in RAM, or the dense weights in RAM and the experts streamed from the SSD through a cache), the engine (built from
-engine/ with CMake unless --engine names one), the download (resumable, checked), the tokenizer from the GGUF, and the run
-config for terminal/serve/server.py. Nothing is downloaded or built with --plan.
+engine/src/inkling with CMake for the CPU, NVIDIA or AMD unless --engine names one; with a GPU the dense weights go to
+VRAM), the download (resumable, checked), the tokenizer from the GGUF, and the run config for terminal/serve/server.py.
+Nothing is downloaded or built with --plan.
 
 This is the interim path until strata-inkling ships in the release packages; docs/INKLING.md says what is and is not done.
 """
@@ -89,24 +90,50 @@ def download(url: str, dest: pathlib.Path, size: int, sha: str):
     say(f"  {dest.name}: SHA-256 checked")
 
 
-def build_engine() -> pathlib.Path:
-    build = ROOT / "engine" / "build" / "inkling"
-    exe = build / ("strata-inkling.exe" if os.name == "nt" else "strata-inkling")
+def detect_backend() -> str:
+    """cuda when the CUDA compiler is here, hip when ROCm's is, else cpu (the engine's GPU path is ggml's backend)."""
+    if shutil.which("nvcc") or (os.environ.get("CUDA_PATH") and pathlib.Path(os.environ["CUDA_PATH"], "bin").exists()):
+        return "cuda"
+    if shutil.which("hipcc") or pathlib.Path("/opt/rocm/bin/hipcc").exists():
+        return "hip"
+    return "cpu"
+
+
+def amd_targets() -> str:
+    """The gfx names of this computer's AMD cards (rocm_agent_enumerator), for -DGPU_TARGETS."""
+    exe = shutil.which("rocm_agent_enumerator") or "/opt/rocm/bin/rocm_agent_enumerator"
+    try:
+        out = subprocess.run([exe], capture_output=True, text=True, timeout=30).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return ";".join(sorted({x for x in out if x.startswith("gfx") and x != "gfx000"}))
+
+
+def build_engine(backend: str) -> pathlib.Path:
+    """strata-inkling from engine/src/inkling's own project: CPU only, or with ggml's CUDA or HIP backend."""
+    build = ROOT / "engine" / "build" / f"inkling-{backend}"
+    exe = build / "bin" / ("strata-inkling.exe" if os.name == "nt" else "strata-inkling")
     if exe.exists():
         return exe
     if not shutil.which("cmake"):
         raise SystemExit("CMake is needed to build strata-inkling (or pass --engine with a built one)")
-    say("  building strata-inkling (a few minutes; the CPU engine needs no GPU toolchain) ...")
+    say(f"  building strata-inkling for {backend} (a few minutes; the GPU backends take longer) ...")
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
-    subprocess.run(["cmake", "-S", str(ROOT / "engine"), "-B", str(build), *gen, "-DCMAKE_BUILD_TYPE=Release",
-                    "-DSTRATA_BUILD_TESTS=OFF"], check=True)
+    flags = ["-DCMAKE_BUILD_TYPE=Release", f"-DINKLING_GPU={'off' if backend == 'cpu' else backend}"]
+    if backend == "cuda":
+        flags.append("-DCMAKE_CUDA_ARCHITECTURES=native")
+    if backend == "hip":
+        targets = amd_targets()
+        if targets:
+            flags.append(f"-DGPU_TARGETS={targets}")
+        if shutil.which("hipcc") is None and pathlib.Path("/opt/rocm/bin/hipcc").exists():
+            flags.append("-DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++")
+    subprocess.run(["cmake", "-S", str(ROOT / "engine" / "src" / "inkling"), "-B", str(build), *gen, *flags], check=True)
     subprocess.run(["cmake", "--build", str(build), "--config", "Release", "--target", "strata-inkling", "-j"], check=True)
-    if not exe.exists():
-        alt = build / "Release" / exe.name
-        if alt.exists():
-            return alt
-        raise SystemExit("the build did not produce strata-inkling")
-    return exe
+    for cand in (exe, build / "bin" / "Release" / exe.name):
+        if cand.exists():
+            return cand
+    raise SystemExit("the build did not produce strata-inkling")
 
 
 def main() -> int:
@@ -115,7 +142,9 @@ def main() -> int:
     ap.add_argument("--data-dir", default=str(pathlib.Path.home() / "strata-inkling"))
     ap.add_argument("--context", type=int, default=32768)
     ap.add_argument("--ram-budget", type=float, help="GiB the engine may use (default: what is free less a margin)")
-    ap.add_argument("--engine", help="a built strata-inkling (default: build it from engine/)")
+    ap.add_argument("--engine", help="a built strata-inkling (default: build it from engine/src/inkling)")
+    ap.add_argument("--backend", choices=["auto", "cpu", "cuda", "hip"], default="auto",
+                    help="build for the CPU only, NVIDIA (cuda) or AMD (hip); auto: by the compilers found")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--plan", action="store_true", help="say what would happen and stop")
     ap.add_argument("--yes", action="store_true", help="no questions")
@@ -142,12 +171,14 @@ def main() -> int:
             return 2
     data = pathlib.Path(a.data_dir).expanduser()
     if a.plan:
-        say(f"  would download to {data / file}, build the engine, and write {data / 'strata-inkling.json'}")
+        backend = detect_backend() if a.backend == "auto" else a.backend
+        say(f"  would build the engine for {backend}, download to {data / file} and write {data / 'strata-inkling.json'}")
         return 0
     if not a.yes and input("  Go on? [Y/n] ").strip().lower() not in ("", "y", "yes"):
         return 1
     data.mkdir(parents=True, exist_ok=True)
-    exe = pathlib.Path(a.engine).resolve() if a.engine else build_engine()
+    backend = detect_backend() if a.backend == "auto" else a.backend
+    exe = pathlib.Path(a.engine).resolve() if a.engine else build_engine(backend)
     url = f"https://huggingface.co/{C.REPO}/resolve/{C.REVISION}/{file}"
     download(url, data / file, nbytes, sha)
     import strata_tokenizer as ST

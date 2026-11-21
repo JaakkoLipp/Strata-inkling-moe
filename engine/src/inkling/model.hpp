@@ -30,8 +30,10 @@ struct Mat {
     int64_t cols = 0, rows = 0;
     size_t row_bytes = 0;
     const uint8_t* data = nullptr;
+    uint64_t file_offset = 0, nbytes = 0;   ///< where it is in the model file
+    void* gpu = nullptr;                    ///< its copy on the GPU (a ggml_tensor), when the dense weights are there
     const uint8_t* row(int64_t r) const { return data + (size_t)r * row_bytes; }
-    bool valid() const { return data != nullptr; }
+    bool valid() const { return data != nullptr || gpu != nullptr; }
 };
 
 /// Where one expert tensor of a layer is in the file: expert e's matrix starts at offset + e * bytes.
@@ -93,7 +95,9 @@ class Model {
 public:
     /// Reads the header and the dense weights of `path`. `embed_from_file` leaves the token embedding table on disk
     /// (one row is read per token): ~250 MB less RAM for a few microseconds per prompt token.
-    Model(const std::string& path, bool embed_from_file);
+    /// With `dense_on_gpu` the big dense matrices (attention projections, output head) are not read into RAM: they
+    /// are listed by gpu_mats() for Gpu::upload. load_gpu_mats_to_ram() reads them after all (no room on the GPU).
+    Model(const std::string& path, bool embed_from_file, bool dense_on_gpu = false);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -117,13 +121,15 @@ public:
     uint64_t dense_bytes() const { return dense_bytes_; }   ///< RAM the dense weights take
     uint64_t expert_bytes_total() const;                    ///< all experts of all layers, as in the file
     uint64_t expert_bytes_max() const;                      ///< the largest single expert (gate_up + down)
+    std::vector<Mat*> gpu_mats() { return gpu_mats_; }
+    void load_gpu_mats_to_ram();
     /// The tokenizer vocabulary as stored in the GGUF (for the dump tools); empty if absent.
     const std::vector<std::string>* vocab() const;
 
 private:
     void load_hparams();
     void build_schedule();
-    void load_weights(bool embed_from_file);
+    void load_weights(bool embed_from_file, bool dense_on_gpu);
 
     std::string path_, layout_;
     std::unique_ptr<GgufFile> gguf_;
@@ -137,7 +143,9 @@ private:
     bool embed_from_file_ = false;
     uint64_t tok_embd_offset_ = 0;
     std::vector<float> output_norm_, output_res_query_, tok_norm_;
+    std::vector<Mat*> gpu_mats_;
     uint8_t* arena_ = nullptr;
+    uint8_t* gpu_arena_ = nullptr;   // the GPU matrices in RAM after all (load_gpu_mats_to_ram)
     uint64_t arena_bytes_ = 0, arena_used_ = 0, dense_bytes_ = 0;
 };
 

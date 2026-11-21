@@ -10,6 +10,7 @@
 #include "engine.hpp"
 #include "expert_store.hpp"
 #include "file_io.hpp"
+#include "gpu.hpp"
 #include "model.hpp"
 #include "plan.hpp"
 #include "serve.hpp"
@@ -40,7 +41,7 @@ namespace {
 
 struct Args {
     std::string model, mode = "info", dump_prefix, ids_file;
-    std::string experts = "auto";
+    std::string experts = "auto", gpu = "auto";
     int ctx = 32768, threads = 0, chunk = 256, io_threads = 8, last = 0, prompt_len = 128, gen = 32;
     double ram_budget = 0, expert_cache = 0;
     bool direct = true, lookahead = false, embed_ram = false;
@@ -49,6 +50,7 @@ struct Args {
 void usage() {
     std::fprintf(stderr,
                  "usage: strata-inkling --model FILE [--serve | --info | --dump-logits PREFIX --ids-file F | --bench]\n"
+                 "  --gpu auto|off|N    the dense weights on a GPU (auto: the first one, if this build has GPU backends)\n"
                  "  --ctx N             context length (default 32768)\n"
                  "  --threads N         compute threads (default: all cores)\n"
                  "  --chunk N           prompt tokens per step (default 256)\n"
@@ -83,6 +85,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--threads" || s == "-t") a.threads = std::atoi(need(i));
         else if (s == "--chunk" || s == "--prefill") a.chunk = std::atoi(need(i));
         else if (s == "--experts") a.experts = need(i);
+        else if (s == "--gpu") a.gpu = need(i);
         else if (s == "--ram-budget") a.ram_budget = std::atof(need(i));
         else if (s == "--expert-cache") a.expert_cache = std::atof(need(i));
         else if (s == "--io-threads") a.io_threads = std::atoi(need(i));
@@ -135,7 +138,23 @@ int main(int argc, char** argv) {
     try {
         Args a = parse(argc, argv);
         auto t_load = clk::now();
-        Model model(a.model, !a.embed_ram);
+        // the GPU first: with one, the dense matrices go straight from the file to VRAM and never take RAM
+        std::string why;
+        std::unique_ptr<Gpu> gpu = a.mode == "info" ? nullptr : Gpu::open(a.gpu, a.threads > 0 ? a.threads : 4, why);
+        if (!gpu && a.gpu != "auto" && a.gpu != "off" && a.mode != "info") throw std::runtime_error(why);
+        Model model(a.model, !a.embed_ram, gpu != nullptr);
+        if (gpu) {
+            if (gpu->upload(model, why)) {
+                std::fprintf(stderr, "inkling: GPU: %s, dense weights in VRAM (%.2f GiB)\n", gpu->name().c_str(),
+                             gpu->weight_bytes() / 1073741824.0);
+            } else {
+                std::fprintf(stderr, "inkling: GPU: %s; the dense weights stay in RAM\n", why.c_str());
+                model.load_gpu_mats_to_ram();
+                gpu.reset();
+            }
+        } else if (a.mode != "info") {
+            std::fprintf(stderr, "inkling: GPU: none (%s); CPU only\n", why.c_str());
+        }
         const Hparams& h = model.hp();
         std::fprintf(stderr, "inkling: %s (%s layout): %d layers, %d applications, %d experts (top %d), vocab %d\n",
                      a.model.c_str(), model.layout().c_str(), h.n_layer, (int)model.schedule().size(), h.n_expert,
@@ -175,6 +194,7 @@ int main(int argc, char** argv) {
         auto store = make_store(model, so);
         std::fprintf(stderr, "inkling: experts: %s\n", store->describe().c_str());
         EngineOptions eo;
+        eo.gpu = gpu.get();
         eo.n_ctx = a.ctx;
         eo.threads = a.threads;
         eo.chunk = a.chunk;

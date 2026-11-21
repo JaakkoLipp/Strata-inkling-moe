@@ -2,7 +2,8 @@
 
 This page is for people who want to run [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a
 computer with little RAM and a fast NVMe SSD. It covers what runs, how memory is split, what was measured and what is not
-done yet. **Status: experimental, CPU only, text only.**
+done yet. **Status: experimental, text only. Builds for the CPU, NVIDIA (CUDA) and AMD (HIP); the GPU build is not
+tested on a GPU yet.**
 
 > **On this page:** [Quick start](#quick-start) · [How it fits in little RAM](#how-it-fits-in-little-ram) ·
 > [Sizes](#sizes) · [Measurements](#measurements) · [Checks](#checks) · [Options](#engine-options) ·
@@ -10,15 +11,16 @@ done yet. **Status: experimental, CPU only, text only.**
 
 ## Quick start
 
-From a source checkout (CMake and a C++20 compiler; no GPU toolkit):
+From a source checkout (CMake and a C++20 compiler; the CUDA toolkit or ROCm for a GPU build):
 
 ```sh
 python terminal/tools/inkling/setup_inkling.py --plan          # what would happen; nothing is changed
 python terminal/tools/inkling/setup_inkling.py --yes --start   # build, download, start the server
 ```
 
-The script picks the size for your free RAM, builds `strata-inkling`, downloads Unsloth's GGUF (pinned revision, size
-and SHA-256 checked), extracts the tokenizer and writes `~/strata-inkling/strata-inkling.json`. The server then answers on
+The script picks the size for your free RAM and builds `strata-inkling` for the GPU whose compiler it finds (`nvcc`: NVIDIA,
+`hipcc`: AMD; `--backend cpu|cuda|hip` chooses). It downloads Unsloth's GGUF (pinned revision, size and SHA-256 checked),
+extracts the tokenizer and writes `~/strata-inkling/strata-inkling.json`. The server then answers on
 `http://127.0.0.1:8080/v1` (OpenAI Chat Completions and Responses) and `/v1/messages` (Anthropic), as for the other models.
 Choose a size with `--model UD-Q4_K_XL`, the context with `--context 16384`, the RAM with `--ram-budget 6`.
 
@@ -49,6 +51,21 @@ So the engine keeps the dense weights in RAM and treats RAM as a cache for the e
   81%; with 41%, 90%.
 
 The token embedding table (246 MB) stays on the SSD too: one row is read per prompt token.
+
+**With a GPU** (`--gpu auto`, the default in a GPU build) the dense weights go from the file straight to VRAM (0.8-1.7 GiB)
+and their products run there, through ggml's CUDA or HIP backend; they then take no RAM, which goes to the expert cache.
+The experts stay in RAM and on the SSD as above and the CPU computes them, as Strata's main engine does for the experts
+that are not in VRAM. The attention over the cache also stays on the CPU. Build it on its own:
+
+```sh
+cmake -S engine/src/inkling -B build-inkling -G Ninja -DCMAKE_BUILD_TYPE=Release -DINKLING_GPU=cuda -DCMAKE_CUDA_ARCHITECTURES=native
+cmake -S engine/src/inkling -B build-inkling -G Ninja -DCMAKE_BUILD_TYPE=Release -DINKLING_GPU=hip -DGPU_TARGETS=gfx1100
+cmake --build build-inkling --target strata-inkling          # (INKLING_GPU=off, the default: CPU only)
+```
+
+Checked without a GPU: with ggml's CPU backend standing in for the GPU (`--gpu cpu`), the same upload, graphs and copies
+gave the CPU path's logits (mean KL 0.00001 over 105 positions) and moved 0.77 GiB of UD-IQ1_S out of RAM. The CUDA and
+HIP builds themselves were not compiled or run here.
 
 ## Sizes
 
@@ -112,7 +129,7 @@ its input and read them while attention runs. The guess was right 52-53% of the 
 speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1.5 GiB (1.5 GiB: 2.14 tok/s on, 2.22 and
 2.25 off). So it is off; it may help on a disk with high latency.
 
-**Not measured yet:** a real NVMe SSD (3-7 GB/s), a computer with 8 or 16 GB of RAM, any GPU.
+**Not measured yet:** a real NVMe SSD (3-7 GB/s), a computer with 8 or 16 GB of RAM, a GPU.
 
 ## Checks
 
@@ -151,6 +168,7 @@ speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1
 
 | Option | Effect |
 | --- | --- |
+| `--gpu auto\|off\|N` | The dense weights on a GPU (`auto`: the first one in a GPU build; `cpu`: ggml's CPU backend, for tests) |
 | `--ctx N` | Context length (default 32768) |
 | `--ram-budget GIB` | All the RAM the engine may use (default: what the OS reports free, less 1 GiB or 10%) |
 | `--expert-cache GIB` | The expert cache directly, instead of the rest of the budget |
@@ -163,7 +181,8 @@ speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1
 
 ## Limits and next steps
 
-- **CPU only.** A GPU would hold the dense weights, the attention caches and the hottest experts: the next step.
+- **GPU: the dense weights only, and not run on a GPU yet.** The next steps there: the attention caches and the most-used
+  experts in VRAM.
 - **Pictures:** not yet (the mmproj files are in the repository; the template marks images).
 - **DSpark drafting:** not yet (Unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf`).
 - **One conversation at a time**, with one rollback point at the end of the last prompt: a client that rewrites the last

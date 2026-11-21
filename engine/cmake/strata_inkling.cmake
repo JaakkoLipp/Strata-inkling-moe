@@ -1,6 +1,8 @@
 # cmake/strata_inkling.cmake - strata-inkling, the engine for Inkling 2 (thinkingmachines/Inkling-2-Mini GGUFs): the
 # whole forward pass on the CPU through ggml-cpu's per-type dot products, the experts in RAM or streamed from the SSD
 # through a fixed RAM budget (src/inkling, docs/INKLING.md). It needs no GPU toolchain, so every build kind can have it.
+# This is the CPU program and its tests; the NVIDIA and AMD builds come from src/inkling/CMakeLists.txt (ggml's CUDA / HIP
+# backends from third_party/strata-llama, which this project does not build).
 #
 # Like the other parts of this tree the block is a macro, run by CMakeLists.txt in its own scope.
 
@@ -21,6 +23,7 @@ macro(strata_inkling)
       src/inkling/model.cpp
       src/inkling/cpu_ops.cpp
       src/inkling/dot_kernels.cpp
+      src/inkling/gpu.cpp
       src/inkling/expert_store.cpp
       src/inkling/engine.cpp
       src/inkling/plan.cpp

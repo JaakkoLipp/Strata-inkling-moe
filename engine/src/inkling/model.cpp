@@ -22,17 +22,33 @@ std::string dims_str(const std::vector<int64_t>& ne) {
 
 }  // namespace
 
-Model::Model(const std::string& path, bool embed_from_file) : path_(path) {
+Model::Model(const std::string& path, bool embed_from_file, bool dense_on_gpu) : path_(path) {
     ggml_cpu_init();
     gguf_ = std::make_unique<GgufFile>(path);
     file_ = std::make_unique<ModelFile>(path, false);
     load_hparams();
     build_schedule();
-    load_weights(embed_from_file);
+    load_weights(embed_from_file, dense_on_gpu);
 }
 
 Model::~Model() {
     if (arena_) aligned_free(arena_);
+    if (gpu_arena_) aligned_free(gpu_arena_);
+}
+
+void Model::load_gpu_mats_to_ram() {
+    uint64_t total = 0;
+    for (Mat* m : gpu_mats_) total += (m->nbytes + 63) / 64 * 64;
+    if (!total || gpu_arena_) return;
+    gpu_arena_ = static_cast<uint8_t*>(aligned_alloc_bytes((size_t)total, 64));
+    uint64_t at = 0;
+    for (Mat* m : gpu_mats_) {
+        file_->read(gpu_arena_ + at, (size_t)m->nbytes, m->file_offset);
+        m->data = gpu_arena_ + at;
+        at += (m->nbytes + 63) / 64 * 64;
+    }
+    dense_bytes_ += total;
+    gpu_mats_.clear();
 }
 
 void Model::load_hparams() {
@@ -152,7 +168,7 @@ void Model::build_schedule() {
     n_slots_ = h.n_layer + (h.looped() ? (h.n_passes - 1) * (end - start) : 0);
 }
 
-void Model::load_weights(bool embed_from_file) {
+void Model::load_weights(bool embed_from_file, bool dense_on_gpu) {
     const GgufFile& g = *gguf_;
     const Hparams& h = hp_;
     const int E = h.n_embd;
@@ -173,14 +189,19 @@ void Model::load_weights(bool embed_from_file) {
 
     // pass 1: the matrices kept in RAM, to size the arena once
     std::vector<std::pair<const GgufTensor*, Mat*>> mats;
-    auto mat = [&](const std::string& name, int64_t cols, int64_t rows, Mat& m) {
+    // `gpu`: one of the big dense matrices, which go to the GPU when there is one (the router and the loop controllers
+    // are small and stay with the CPU code that uses them)
+    auto mat = [&](const std::string& name, int64_t cols, int64_t rows, Mat& m, bool gpu = true) {
         const GgufTensor& t = need(name);
         check(t, {cols, rows});
         m.type = t.type;
         m.cols = cols;
         m.rows = rows;
         m.row_bytes = (size_t)ggml_bytes(t.type, cols);
-        mats.push_back({&t, &m});
+        m.file_offset = t.offset;
+        m.nbytes = t.nbytes;
+        if (dense_on_gpu && gpu) gpu_mats_.push_back(&m);
+        else mats.push_back({&t, &m});
     };
     auto vecf = [&](const std::string& name, std::vector<int64_t> ne, std::vector<float>& out, bool optional = false) {
         const GgufTensor* t = g.tensor(name);
@@ -236,7 +257,7 @@ void Model::load_weights(bool embed_from_file) {
         }
         vecf(blk(i, "ffn_res_query.weight"), {E}, L.ffn_res_query);
         vecf(blk(i, "ffn_norm.weight"), {E}, L.ffn_norm);
-        mat(blk(i, "ffn_gate_inp.weight"), E, h.n_expert, L.router);
+        mat(blk(i, "ffn_gate_inp.weight"), E, h.n_expert, L.router, false);
         vecf(blk(i, "exp_probs_b.bias"), {h.n_expert}, L.exp_probs_b, true);
 
         auto experts = [&](const char* name, int64_t cols, int64_t rows, ExpertTensor& et) {
@@ -273,9 +294,9 @@ void Model::load_weights(bool embed_from_file) {
             LoopLayer& LL = loop_[c];
             for (int k = 0; k < 4; ++k) {
                 std::string base = root ? root_ctrl[k] : mainline_ctrl[k];
-                mat(blk(il, (base + "_down.weight").c_str()), 2 * (int64_t)E, h.gate_rank, LL.down[k]);
-                mat(blk(il, (base + "_gain.weight").c_str()), h.gate_rank, E, LL.gain[k]);
-                mat(blk(il, (base + "_forget.weight").c_str()), h.gate_rank, E, LL.forget[k]);
+                mat(blk(il, (base + "_down.weight").c_str()), 2 * (int64_t)E, h.gate_rank, LL.down[k], false);
+                mat(blk(il, (base + "_gain.weight").c_str()), h.gate_rank, E, LL.gain[k], false);
+                mat(blk(il, (base + "_forget.weight").c_str()), h.gate_rank, E, LL.forget[k], false);
             }
             if (root) {
                 // the converter's order (conversion/inkling2.py): q[2c], kv[2c], kv[2c+1], q[2c+1] = the q, k, v, ffn messages

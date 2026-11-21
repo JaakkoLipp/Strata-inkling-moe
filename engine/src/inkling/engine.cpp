@@ -2,6 +2,7 @@
 #include "engine.hpp"
 
 #include "dot_kernels.hpp"
+#include "gpu.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -146,6 +147,18 @@ bool Engine::rollback(const Snapshot& snap) {
     return true;
 }
 
+void Engine::mm(std::initializer_list<MM> jobs, int T) {
+    Gpu::Job gj[16];
+    int ng = 0;
+    for (const MM& j : jobs) {
+        if (opt_.gpu && j.W->gpu && j.ldx == j.W->cols && j.ldy == j.W->rows && ng < 16)
+            gj[ng++] = Gpu::Job{j.W, j.x, T, j.y, j.ldy};
+        else
+            matmul_f(*pool_, *j.W, j.x, T, j.ldx, j.y, j.ldy, b_->qa);
+    }
+    if (ng) opt_.gpu->run(gj, ng);
+}
+
 // ------------------------------------------------------------------------------------------------ building blocks
 
 // mix(): attention over the depth. states are in llama.cpp's order (the blocks last to first, then cur); every
@@ -247,19 +260,20 @@ void Engine::attention(const Layer& L, int slot, int T, int p0) {
     float* past_v = conv + (size_t)(nc - 1) * kvd;
     float* past_a = conv + (size_t)2 * (nc - 1) * kvd;
 
-    // projections (inkling2.cpp: Qcur, Kcur, Vcur, Rcur, sinks, the output gate)
-    matmul_f(*pool_, L.wq, b.in0.data(), T, E, b.q.data(), qd, b.qa);
-    matmul_f(*pool_, L.wk, b.in1.data(), T, E, b.k.data(), kvd, b.qa);
-    matmul_f(*pool_, L.wv, b.in2.data(), T, E, b.v.data(), kvd, b.qb);
-    if (!swa) {
-        matmul_f(*pool_, L.k_conv_proj, b.in1.data(), T, E, b.kdyn.data(), nc * nkv, b.qa);
-        matmul_f(*pool_, L.v_conv_proj, b.in2.data(), T, E, b.vdyn.data(), nc * nkv, b.qb);
+    // projections (inkling2.cpp: Qcur, Kcur, Vcur, Rcur, sinks, the output gate): one batch, one graph on a GPU
+    if (swa) {
+        mm({{&L.wq, b.in0.data(), E, b.q.data(), qd}, {&L.wk, b.in1.data(), E, b.k.data(), kvd},
+            {&L.wv, b.in2.data(), E, b.v.data(), kvd}, {&L.wrel, b.in0.data(), E, b.r.data(), (int64_t)nrel * nh},
+            {&L.sink_proj, b.in0.data(), E, b.sinks.data(), nh}, {&L.wgate, b.in0.data(), E, b.gate.data(), qd}}, T);
+    } else {
+        mm({{&L.wq, b.in0.data(), E, b.q.data(), qd}, {&L.wk, b.in1.data(), E, b.k.data(), kvd},
+            {&L.wv, b.in2.data(), E, b.v.data(), kvd}, {&L.k_conv_proj, b.in1.data(), E, b.kdyn.data(), nc * nkv},
+            {&L.v_conv_proj, b.in2.data(), E, b.vdyn.data(), nc * nkv},
+            {&L.wrel, b.in0.data(), E, b.r.data(), (int64_t)nrel * nh},
+            {&L.sink_proj, b.in0.data(), E, b.sinks.data(), nh}, {&L.wgate, b.in0.data(), E, b.gate.data(), qd}}, T);
     }
     convolve(b.k.data(), T, kvd, L.k_conv, swa ? nullptr : b.kdyn.data(), nkv, past_k);
     convolve(b.v.data(), T, kvd, L.v_conv, swa ? nullptr : b.vdyn.data(), nkv, past_v);
-    matmul_f(*pool_, L.wrel, b.in0.data(), T, E, b.r.data(), (int64_t)nrel * nh, b.qa);
-    matmul_f(*pool_, L.sink_proj, b.in0.data(), T, E, b.sinks.data(), nh, b.qa);
-    matmul_f(*pool_, L.wgate, b.in0.data(), T, E, b.gate.data(), qd, b.qa);
 
     // clips, the value norm and the log-scaled positions of the full-attention layers
     for (int t = 0; t < T; ++t) {
@@ -415,7 +429,7 @@ void Engine::attention(const Layer& L, int slot, int T, int p0) {
     // gate, output projection, the post-attention convolution
     dbg("kqv_out", slot, b.att.data(), (size_t)T * qd);
     for (size_t i = 0; i < (size_t)T * qd; ++i) b.att[i] *= sigmoidf(b.gate[i]);
-    matmul_f(*pool_, L.wo, b.att.data(), T, qd, b.o.data(), E, b.qa);
+    mm({{&L.wo, b.att.data(), qd, b.o.data(), E}}, T);
     dbg("wo_out", slot, b.o.data(), (size_t)T * E);
     convolve(b.o.data(), T, E, L.attn_post_conv, nullptr, 0, past_a);
     dbg("attn_out", slot, b.o.data(), (size_t)T * E);
@@ -769,7 +783,7 @@ void Engine::head(int T, const std::vector<std::vector<float>>& blocks, std::vec
     Mat W = m_.output();
     W.rows = NV;
     std::vector<float> lg((size_t)n * NV);
-    matmul_f(*pool_, W, &b.x[(size_t)first * E], n, E, lg.data(), NV, b.qa);
+    mm({{&W, &b.x[(size_t)first * E], E, lg.data(), NV}}, n);
     if (h.softcap != 0.0f) {
         const float cap = h.softcap, ic = 1.0f / cap;
         for (float& v : lg) v = std::tanh(v * ic) * cap;

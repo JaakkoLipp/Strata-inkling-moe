@@ -14,12 +14,16 @@
 #include "model.hpp"
 
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <vector>
 
 namespace strata::inkling {
 
+class Gpu;
+
 struct EngineOptions {
+    Gpu* gpu = nullptr;       ///< the dense matrices with a `gpu` copy run there (gpu.hpp)
     int n_ctx = 32768;
     int threads = 0;          ///< 0: the physical cores
     int chunk = 256;          ///< prompt tokens per step
@@ -82,6 +86,16 @@ public:
 
 private:
     struct Buf;
+    /// One matrix product: y [T][ldy] = W . x [T][ldx]
+    struct MM {
+        const Mat* W;
+        const float* x;
+        int64_t ldx;
+        float* y;
+        int64_t ldy;
+    };
+    /// Runs the products whose weights are on the GPU as one graph there, the others on the CPU.
+    void mm(std::initializer_list<MM> jobs, int T);
     void run_chunk(const int* tokens, int T, std::vector<float>* last, std::vector<float>* all, int all_row0);
     void apply(const Application& app, int T, std::vector<std::vector<float>>& blocks, const float* msgs);
     void attention(const Layer& L, int slot, int T, int p0);
