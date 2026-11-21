@@ -25,6 +25,18 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
+> [!NOTE]
+> **This is a fork: Strata with Inkling 2 Mini.** It adds `strata-inkling`, an engine for
+> [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26.4B parameters, 128 experts per layer) on
+> computers with little RAM. On NVIDIA and AMD cards the dense weights and the most-used experts run in VRAM; the rest of
+> the experts stay in RAM, and those that do not fit there are read from the SSD as they are needed. On an RX 9070 XT
+> with 14 GiB of RAM and 256K of context it decoded a 600-token reply at 29 tok/s
+> ([measured on](docs/INKLING.md#a-desktop-with-a-gpu-ud-q4_k_xl)). Everything else is [Niko1221/Strata](https://github.com/Niko1221/Strata), kept in sync
+> with its `main`.
+>
+> **Status: experimental, text only, from a source checkout.** The installers and `strata launch` do not include it yet.
+> [Inkling 2 Mini guide](docs/INKLING.md) · [jump to the quick start](#inkling-2-mini)
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
@@ -52,6 +64,30 @@ We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where 
 
 </details>
 
+<a id="inkling-2-mini"></a>
+
+<details>
+<summary>&nbsp;<b>Inkling 2 Mini · this fork · experimental</b></summary>
+
+**Unsloth:** all ten sizes, from UD-IQ1\_S (7.8 GB) to UD-Q8\_K\_XL. The setup script picks **UD-Q4\_K\_XL** (17.6 GB)
+when at least a tenth of its experts fit in your free RAM, and reads the rest from the SSD. A fast NVMe SSD keeps this
+usable; a hard disk does not.
+
+From a source checkout (CMake and a C++20 compiler; ROCm or the CUDA toolkit for a GPU build, which puts the dense
+weights and the most-used experts in VRAM; `--vram-budget GIB` caps how much it takes):
+
+```sh
+python terminal/tools/inkling/setup_inkling.py --plan          # what would happen; nothing is changed
+python terminal/tools/inkling/setup_inkling.py --yes --start   # build, download, start the server
+```
+
+The server answers on `http://127.0.0.1:8080/v1` (OpenAI) and `/v1/messages` (Anthropic), like the other models.
+Text only for now: no pictures and no drafting yet.
+
+[How it fits in little RAM, sizes, measurements and checks](docs/INKLING.md).
+
+</details>
+
 <a id="the-other-sizes"></a>
 
 Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
@@ -67,7 +103,7 @@ Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-me
 Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
 downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
 
-<sub>Files: `Strata-0.2.17-windows-x64-setup.exe` · `Strata-0.2.17-linux-x86_64.AppImage` · `Strata-0.2.17-macos-arm64.dmg`</sub>
+<sub>Files: `Strata-0.2.18-windows-x64-setup.exe` · `Strata-0.2.18-linux-x86_64.AppImage` · `Strata-0.2.18-macos-arm64.dmg`</sub>
 
 <p align="center">
   <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">

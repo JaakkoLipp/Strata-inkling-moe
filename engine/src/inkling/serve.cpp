@@ -1,6 +1,8 @@
 // src/inkling/serve.cpp - see serve.hpp.
 #include "serve.hpp"
 
+#include "gpu.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -232,6 +234,7 @@ int run_serve(Engine& eng, ExpertStore& store, const MemoryPlan& plan) {
         std::fflush(stdout);
 
         const StoreStats s0 = store.stats();
+        const GpuExpertStats gs0 = eng.gpu() ? eng.gpu()->expert_stats() : GpuExpertStats{};
         auto t0 = clk::now();
         const size_t fresh = ids.size() - reuse;
         size_t done = 0;
@@ -304,6 +307,15 @@ int run_serve(Engine& eng, ExpertStore& store, const MemoryPlan& plan) {
         }
         const double decode_ms = ms_since(d0);
         const StoreStats s2 = store.stats();
+        // the GPU tier's share of this reply's expert lookups (the DONE line keeps the RAM cache's numbers)
+        std::string vram;
+        if (Gpu* g = eng.gpu(); g && g->has_experts()) {
+            const GpuExpertStats ge = g->expert_stats();
+            char tmp[96];
+            std::snprintf(tmp, sizeof tmp, "; %.1f%% of lookups on the GPU",
+                          ge.lookups > gs0.lookups ? 100.0 * (ge.hits - gs0.hits) / (ge.lookups - gs0.lookups) : 0.0);
+            vram = tmp;
+        }
         const uint64_t hits = s2.hits - s1.hits, lookups = hits + (s2.misses - s1.misses);
         const double file_mb = (double)(s2.bytes_read - s0.bytes_read) / 1e6;
         std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu %llu %llu %llu %llu %.1f %zu 0\n", produced, ids.size(), prompt_ms,
@@ -312,10 +324,10 @@ int run_serve(Engine& eng, ExpertStore& store, const MemoryPlan& plan) {
         std::fflush(stdout);
         std::fprintf(stderr,
                      "inkling serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s); %lld generated in "
-                     "%.0f ms (%.2f tok/s, %s); experts %.1f%% from RAM, %.0f MB from the SSD\n",
+                     "%.0f ms (%.2f tok/s, %s); experts %.1f%% from RAM, %.0f MB from the SSD%s\n",
                      ids.size(), reuse, fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, finish,
-                     lookups ? 100.0 * hits / lookups : 100.0, file_mb);
+                     lookups ? 100.0 * hits / lookups : 100.0, file_mb, vram.c_str());
     };
 
     for (;;) {
