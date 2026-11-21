@@ -55,6 +55,13 @@ public:
     /// Blocks until all are in RAM.
     virtual void acquire(int layer, const int* ids, int n, ExpertView* out) = 0;
     virtual void release(int layer, const int* ids, int n) = 0;
+    /// acquire() in two halves, so that a layer can compute the experts it has while the others are read: begin() pins
+    /// the experts and starts the reads without waiting; wait() waits for some of them and gives their views. Every
+    /// begun expert is released once.
+    virtual void begin(int layer, const int* ids, int n) { (void)layer; (void)ids; (void)n; }
+    virtual void wait(int layer, const int* ids, int n, ExpertView* out) { acquire(layer, ids, n, out); }
+    /// Whether an expert is in RAM now (for ordering work; it can change once the engine claims slots).
+    virtual bool ready(int layer, int id) const { (void)layer; (void)id; return true; }
     /// A hint: these experts will probably be needed soon. Never blocks; may do nothing.
     virtual void prefetch(int layer, const int* ids, int n) { (void)layer; (void)ids; (void)n; }
     /// How many experts can be pinned at the same time (the MoE runs a prompt's experts in waves of at most this).

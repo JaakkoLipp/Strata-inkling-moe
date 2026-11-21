@@ -100,8 +100,12 @@ The hit rates and the bytes read were the same in every run. The speed was not: 
 has cached the file and slow where it has not, so the same setting decoded at 1.1 or 2.3 tok/s. Without the time spent
 waiting for reads, decoding took 0.27 s per token at every cache size (about 3.7 tok/s): that is this CPU's limit. On
 another computer, a rough estimate per token is that compute time plus the MiB read divided by the SSD's speed: at
-3 GB/s, 688 MiB is 0.24 s and 97 MiB is 0.03 s. That is an estimate, not a measurement. The engine does not yet compute
-the experts it has while it reads the missing ones of the same layer (see [next steps](#limits-and-next-steps)).
+3 GB/s, 688 MiB is 0.24 s and 97 MiB is 0.03 s. That is an estimate, not a measurement.
+
+**Reading while computing.** A layer computes the experts it has in RAM while its missing ones are read, and waits only
+for those. In interleaved runs (the same settings, on and off with `STRATA_INKLING_NO_OVERLAP=1`, while another job used
+the CPU) the time spent waiting for the SSD over 48 tokens fell from 9.5 to 6.2 s with a 1.5 GiB cache and from 2.8 to
+1.3 s with 6 GiB. The table above was measured before this change.
 
 **Lookahead (`--lookahead`, off by default).** Before a layer's attention, the engine can guess the layer's experts from
 its input and read them while attention runs. The guess was right 52-53% of the time. With the disk warm it changed the
@@ -165,8 +169,8 @@ speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1
 - **One conversation at a time**, with one rollback point at the end of the last prompt: a client that rewrites the last
   reply (for example without its thinking) continues from there; anything earlier is read again.
 - **Prompt speed** is about half of llama.cpp's on the CPU (see above): the dense projections need matrix kernels.
-- **Reads and compute do not overlap within a layer yet:** a layer waits for all its missing experts before it computes
-  any. Computing the experts it has while the others load is the next step for the SSD path.
+- **Reads overlap compute only within a layer:** the next layer's experts are not known before its input is (the
+  lookahead guess was not good enough, see above).
 - Checked against llama.cpp: UD-IQ1_S and UD-IQ3_XXS. The other sizes use the same expert types (and BF16, Q3_K, Q4_K,
   Q5_K, Q5_0, Q8_0, MXFP4 from ggml) but were not compared token by token.
 

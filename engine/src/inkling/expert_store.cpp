@@ -299,11 +299,23 @@ public:
     }
 
     void acquire(int layer, const int* ids, int n, ExpertView* out) override {
+        begin(layer, ids, n);
+        wait_views(layer, ids, n, out);
+    }
+
+    void wait(int layer, const int* ids, int n, ExpertView* out) override { wait_views(layer, ids, n, out); }
+
+    bool ready(int layer, int id) const override {
+        const SlotCache& C = *pools_[layer_pool_[layer]].cache;
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = C.find(layer * m_.hp().n_expert + id);
+        return s >= 0 && C.slot(s).state == SlotCache::State::Ready;
+    }
+
+    void begin(int layer, const int* ids, int n) override {
         const int E = m_.hp().n_expert;
         const int pi = layer_pool_[layer];
-        Pool& P = pools_[pi];
-        SlotCache& C = *P.cache;
-        std::vector<int> slots(n);
+        SlotCache& C = *pools_[pi].cache;
         std::unique_lock<std::mutex> lk(mu_);
         bool queued = false;
         for (int i = 0; i < n; ++i) {
@@ -332,25 +344,8 @@ public:
                 queued = true;
             }
             C.slot(s).pins++;
-            slots[i] = s;
         }
         if (queued) io_cv_.notify_all();
-        auto t0 = clk::now();
-        bool waited = false;
-        for (int i = 0; i < n; ++i) {
-            while (C.slot(slots[i]).state != SlotCache::State::Ready) {
-                if (!error_.empty()) throw std::runtime_error(error_);
-                waited = true;
-                ready_cv_.wait(lk);
-            }
-        }
-        if (waited) stats_.stall_s += secs(clk::now() - t0);
-        const Layer& L = m_.layers()[layer];
-        for (int i = 0; i < n; ++i) {
-            const uint8_t* base = P.arena + (size_t)slots[i] * P.slot_bytes;
-            out[i].gate_up = expert_mat(L.gate_up, base + P.gu_off[slots[i]]);
-            out[i].down = expert_mat(L.down, base + P.cap_gu + P.down_off[slots[i]]);
-        }
     }
 
     void release(int layer, const int* ids, int n) override {
@@ -379,6 +374,30 @@ public:
             queued = true;
         }
         if (queued) io_cv_.notify_all();
+    }
+
+    // the views of begun (pinned) experts, once they are read
+    void wait_views(int layer, const int* ids, int n, ExpertView* out) {
+        const int E = m_.hp().n_expert;
+        Pool& P = pools_[layer_pool_[layer]];
+        SlotCache& C = *P.cache;
+        std::unique_lock<std::mutex> lk(mu_);
+        auto t0 = clk::now();
+        bool waited = false;
+        const Layer& L = m_.layers()[layer];
+        for (int i = 0; i < n; ++i) {
+            const int s = C.find(layer * E + ids[i]);
+            if (s < 0) throw std::runtime_error("an expert was waited for without begin()");
+            while (C.slot(s).state != SlotCache::State::Ready) {
+                if (!error_.empty()) throw std::runtime_error(error_);
+                waited = true;
+                ready_cv_.wait(lk);
+            }
+            const uint8_t* base = P.arena + (size_t)s * P.slot_bytes;
+            out[i].gate_up = expert_mat(L.gate_up, base + P.gu_off[s]);
+            out[i].down = expert_mat(L.down, base + P.cap_gu + P.down_off[s]);
+        }
+        if (waited) stats_.stall_s += secs(clk::now() - t0);
     }
 
     StoreStats stats() const override {

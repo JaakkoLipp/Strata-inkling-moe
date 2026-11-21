@@ -527,16 +527,36 @@ void Engine::moe(int layer, int T) {
     // the other half the next one, read meanwhile
     int wave_max = std::max(1, store_.max_pinned());
     if (store_.mode() == StoreMode::Stream && (int)needed.size() > wave_max) wave_max = std::max(1, wave_max / 2);
-    if (T > 1) store_.prefetch(layer, needed.data(), std::min((int)needed.size(), wave_max));
+    // When the layer's experts fit in one wave of a streamed store, the ones in RAM are computed first while the missing
+    // ones are read (begin() starts every read, wait() takes them in two groups). The result does not depend on the
+    // order: every (token, rank) output has its own place and they are summed in rank order below.
+    std::vector<std::pair<size_t, int>> waves;
+    bool begun = false;
+    static const bool no_overlap = std::getenv("STRATA_INKLING_NO_OVERLAP") != nullptr;   // A/B: wait for all first
+    if (store_.mode() == StoreMode::Stream && (int)needed.size() <= wave_max && !no_overlap) {
+        const auto mid = std::stable_partition(needed.begin(), needed.end(), [&](int e) { return store_.ready(layer, e); });
+        const int nr = (int)(mid - needed.begin()), nn = (int)needed.size();
+        store_.begin(layer, needed.data(), nn);
+        begun = true;
+        if (nr > 0) waves.push_back({0, nr});
+        if (nr < nn) waves.push_back({(size_t)nr, nn - nr});
+    } else {
+        if (T > 1) store_.prefetch(layer, needed.data(), std::min((int)needed.size(), wave_max));
+        for (size_t w0 = 0; w0 < needed.size(); w0 += (size_t)wave_max)
+            waves.push_back({w0, (int)std::min<size_t>((size_t)wave_max, needed.size() - w0)});
+    }
     std::vector<ExpertView> views;
     const int R1 = 2 * F;
-    for (size_t w0 = 0; w0 < needed.size(); w0 += (size_t)wave_max) {
-        const int nw = (int)std::min<size_t>((size_t)wave_max, needed.size() - w0);
+    for (const auto& [w0, nw] : waves) {
         const int* wids = &needed[w0];
         views.resize(nw);
-        store_.acquire(layer, wids, nw, views.data());
-        if (w0 + nw < needed.size())
-            store_.prefetch(layer, wids + nw, (int)std::min<size_t>((size_t)wave_max, needed.size() - w0 - nw));
+        if (begun) {
+            store_.wait(layer, wids, nw, views.data());
+        } else {
+            store_.acquire(layer, wids, nw, views.data());
+            if (w0 + nw < needed.size())
+                store_.prefetch(layer, wids + nw, (int)std::min<size_t>((size_t)wave_max, needed.size() - w0 - nw));
+        }
         // assignments of this wave, grouped by expert
         std::vector<int> off(nw + 1, 0), asg;
         for (int u = 0; u < nw; ++u) {
