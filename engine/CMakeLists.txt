@@ -20,6 +20,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/quant.cmake)       # strata_q
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/cuda.cmake)        # NVIDIA: toolchain, Strata's prompt kernels (strata_pf_own)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/backends/hip.cmake)         # AMD: gfx906 compat, Strata's prompt kernels on HIP
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_gpu_engine.cmake)    # the GPU engine both of them build
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_inkling.cmake)       # strata-inkling: the Inkling 2 engine (CPU, experts from the SSD)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -804,6 +805,7 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_
 endif()
 
 strata_cpu_tests()
+strata_inkling()
 
 # CUDA release kernels must not spill or keep a per-thread array in local memory: every access there is a round trip
 # to device memory in the hottest loops the engine has, and nothing on the build machine says so without -Xptxas -v
