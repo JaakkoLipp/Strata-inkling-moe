@@ -2,11 +2,11 @@
 
 This page is for people who want to run [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a
 computer with little RAM and a fast NVMe SSD. It covers what runs, how memory is split, what was measured and what is not
-done yet. **Status: experimental, text only. Builds for the CPU, NVIDIA (CUDA) and AMD (HIP); the GPU build is not
-tested on a GPU yet.**
+done yet. **Status: experimental, text only. Builds for the CPU, NVIDIA (CUDA) and AMD (HIP). Measured on an AMD
+Radeon RX 9070 XT (HIP); the CUDA build uses the same code but was not compiled or run here.**
 
 > **On this page:** [Quick start](#quick-start) · [How it fits in little RAM](#how-it-fits-in-little-ram) ·
-> [Sizes](#sizes) · [Measurements](#measurements) · [Checks](#checks) · [Options](#engine-options) ·
+> [With a GPU](#with-a-gpu) · [Sizes](#sizes) · [Measurements](#measurements) · [Checks](#checks) · [Options](#engine-options) ·
 > [Limits and next steps](#limits-and-next-steps)
 
 ## Quick start
@@ -52,20 +52,34 @@ So the engine keeps the dense weights in RAM and treats RAM as a cache for the e
 
 The token embedding table (246 MB) stays on the SSD too: one row is read per prompt token.
 
-**With a GPU** (`--gpu auto`, the default in a GPU build) the dense weights go from the file straight to VRAM (0.8-1.7 GiB)
-and their products run there, through ggml's CUDA or HIP backend; they then take no RAM, which goes to the expert cache.
-The experts stay in RAM and on the SSD as above and the CPU computes them, as Strata's main engine does for the experts
-that are not in VRAM. The attention over the cache also stays on the CPU. Build it on its own:
+## With a GPU
+
+With `--gpu auto` (the default in a GPU build) the GPU does two things:
+
+- **The dense weights** (attention projections and the output head, 1.1 GiB of UD-Q4_K_XL) go from the file straight to
+  VRAM and their products run there. They then take no RAM, which goes to the expert cache.
+- **The most-used experts** fill the rest of the VRAM. This is a cache in front of the RAM cache: an expert is copied up
+  from RAM the first time it is used while there is room, and once it is used twice when the cache is full. The experts
+  that leave are picked by the same clock with use counts as in RAM. A layer runs the experts it has in VRAM on the GPU
+  (ggml's `mul_mat_id`) while the CPU computes the others, and the outputs are summed in the same order as before.
+
+`--vram-budget GIB` caps all the VRAM the engine uses (default: what is free, less 1 GiB). `--vram-budget 0` keeps
+only the dense weights there. The attention over the cache, the routing and the small loop controllers stay on the CPU.
+
+Every copy to and from the GPU goes through pinned host memory, and a call waits once. Decoding makes about 140 GPU
+calls per token (three per layer application); on the RX 9070 XT each costs about 0.1 ms, which is now a large part of
+the time per token.
+
+Build it on its own:
 
 ```sh
 cmake -S engine/src/inkling -B build-inkling -G Ninja -DCMAKE_BUILD_TYPE=Release -DINKLING_GPU=cuda -DCMAKE_CUDA_ARCHITECTURES=native
-cmake -S engine/src/inkling -B build-inkling -G Ninja -DCMAKE_BUILD_TYPE=Release -DINKLING_GPU=hip -DGPU_TARGETS=gfx1100
+cmake -S engine/src/inkling -B build-inkling -G Ninja -DCMAKE_BUILD_TYPE=Release -DINKLING_GPU=hip -DGPU_TARGETS=gfx1201
 cmake --build build-inkling --target strata-inkling          # (INKLING_GPU=off, the default: CPU only)
 ```
 
-Checked without a GPU: with ggml's CPU backend standing in for the GPU (`--gpu cpu`), the same upload, graphs and copies
-gave the CPU path's logits (mean KL 0.00001 over 105 positions) and moved 0.77 GiB of UD-IQ1_S out of RAM. The CUDA and
-HIP builds themselves were not compiled or run here.
+Use your card's gfx name for `GPU_TARGETS` (`rocm_agent_enumerator` prints it). The HIP build links ROCm's libraries
+dynamically: ROCm has no static ones.
 
 ## Sizes
 
@@ -129,7 +143,34 @@ its input and read them while attention runs. The guess was right 52-53% of the 
 speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1.5 GiB (1.5 GiB: 2.14 tok/s on, 2.22 and
 2.25 off). So it is off; it may help on a disk with high latency.
 
-**Not measured yet:** a real NVMe SSD (3-7 GB/s), a computer with 8 or 16 GB of RAM, a GPU.
+### A desktop with a GPU (UD-Q4_K_XL)
+
+> **Measured on:** Intel Core with 8 performance and 8 efficiency cores (24 threads), 31 GiB of DDR5, AMD Radeon RX 9070
+> XT (16 GB, gfx1201, ROCm 7), Kingston KC3000 NVMe SSD, Arch Linux. strata-inkling at this branch, 16 threads. Single
+> runs, greedy decoding, except the server reply (temperature 0.7). The bench's decode tokens repeat, which makes the
+> RAM cache's hit rate higher than in a real reply.
+
+| Setup | Prompt | Decode |
+| --- | ---: | ---: |
+| CPU only, every expert in RAM (512-token prompt, 64 tokens) | 44.3 tok/s | 14.7 tok/s |
+| GPU for the dense weights only (`--vram-budget 0`) | 53.4 tok/s | 13.9 tok/s |
+| GPU for the dense weights and 13 GiB of experts (16-token prompt, 160 tokens) | - | 31.1 tok/s |
+| 256K context, RAM capped at 14 GiB, GPU experts (2,048-token prompt, 160 tokens) | 62.7 tok/s | 21.3 tok/s |
+| The same with RAM capped at 10 GiB | 60.1 tok/s | 21.2 tok/s |
+| 256K context, 14 GiB of RAM, GPU experts: a 600-token reply through the server | - | 29.3 tok/s |
+
+Before the experts went to VRAM, the same 256K runs decoded at 11.7 tok/s (14 GiB) and 5.3 tok/s (10 GiB, 736 MiB read
+from the SSD per token). With 2,717 experts in VRAM (88% of them), 99% of the lookups found their expert there and the
+SSD read 5-11 MiB per token. The peak RAM of the 10 GiB run was 2.5 GiB. The 600-token reply used 15 GiB of the card's
+16 GB (with the desktop); set `--vram-budget` to keep room for other programs.
+
+The default thread count is now the physical cores (16 here). All 24 hardware threads decoded at 7.3 tok/s against
+14.5 with 16 (CPU only, every expert in RAM).
+
+At 2,048 tokens of context the attention over the cache took 27 ms of the 47 ms per token; it runs on the CPU and grows
+with the context.
+
+**Not measured yet:** a computer with 8 or 16 GB of RAM, an NVIDIA GPU, a context filled past a few thousand tokens.
 
 ## Checks
 
@@ -155,6 +196,14 @@ speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1
   4-slot cache; a rollback and a fresh run: all give the same logits, bit for bit.
 - **`inkling_store_test`**: the slot cache, the RAM budget split, direct reads at unaligned offsets and the end of a
   file, and the SIMD Q2_0 kernels against a double-precision sum.
+- **The GPU path** (`--dump-logits`, 835-token prompt, last 600 positions, against the CPU path): with ggml's CPU backend
+  standing in for the GPU (`--gpu cpu --vram-budget 8`, 84% of the lookups through the GPU expert graph), the logits
+  are the CPU path's (mean KL 0.0000). On the RX 9070 XT they differ: mean KL 0.14 (median 0.008), the same with the
+  experts on the GPU or only the dense weights; the prompt's own next tokens were predicted 0.059 ± 0.030 nats worse
+  with the dense weights only and 0.012 ± 0.034 worse with the experts too. Each kind of matrix on its own gives the
+  same difference, so it is the GPU kernels' rounding (they quantize the activations to 8 bits per 32 values) carried
+  through 48 routing choices, not one wrong kernel. A few positions differ a lot where the choice of the 8th expert is
+  close.
 - **The tokenizer** (`terminal/tools/inkling/tokenizer_check.py`): 18 strings (case runs, contractions, digits, CJK,
   Arabic, emoji, combining marks, whitespace, the chat tokens) give llama.cpp's ids and decode back.
 - **The protocol** (`terminal/tools/inkling/serve_gate.py`): a continued conversation and a rollback give a fresh engine's
@@ -168,7 +217,8 @@ speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1
 
 | Option | Effect |
 | --- | --- |
-| `--gpu auto\|off\|N` | The dense weights on a GPU (`auto`: the first one in a GPU build; `cpu`: ggml's CPU backend, for tests) |
+| `--gpu auto\|off\|N` | The dense weights and the most-used experts on a GPU (`auto`: the first one in a GPU build; `cpu`: ggml's CPU backend, for tests) |
+| `--vram-budget GIB` | All the VRAM the engine may use (default: what is free, less 1 GiB); `0`: the dense weights only |
 | `--ctx N` | Context length (default 32768) |
 | `--ram-budget GIB` | All the RAM the engine may use (default: what the OS reports free, less 1 GiB or 10%) |
 | `--expert-cache GIB` | The expert cache directly, instead of the rest of the budget |
@@ -176,13 +226,19 @@ speed by -3% to +2% and always read more: +74% with a 9.5 GiB cache, +60% with 1
 | `--io-threads N` | Parallel SSD reads (default 8) |
 | `--no-direct-io` | Read through the OS page cache |
 | `--lookahead` | Guess and read a layer's experts during its attention (see above) |
-| `--threads N`, `--chunk N` | Compute threads (default all), prompt tokens per step (default 256) |
+| `--threads N`, `--chunk N` | Compute threads (default: the physical cores), prompt tokens per step (default 256) |
 | `--bench --prompt-len N --gen N` | Prompt and decode speed with the expert cache's numbers |
 
 ## Limits and next steps
 
-- **GPU: the dense weights only, and not run on a GPU yet.** The next steps there: the attention caches and the most-used
-  experts in VRAM.
+- **GPU: the attention stays on the CPU.** It is the largest part of a token once the experts are in VRAM, and it grows
+  with the context. The next step: the attention caches and each whole layer application on the GPU, one call per
+  layer instead of three.
+- **GPU: NVIDIA not tested.** The CUDA build uses the same ggml backend calls (and CUDA graphs) but was not compiled or
+  run here.
+- **GPU numbers differ from the CPU's** (see [Checks](#checks)): the same in kind as llama.cpp's GPU against its CPU,
+  larger on this model because one rounding can change an expert choice.
+- **The VRAM expert cache starts empty** and fills during the first replies (about 4.5 GiB copied in 160 tokens here).
 - **Pictures:** not yet (the mmproj files are in the repository; the template marks images).
 - **DSpark drafting:** not yet (Unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf`).
 - **One conversation at a time**, with one rollback point at the end of the last prompt: a client that rewrites the last

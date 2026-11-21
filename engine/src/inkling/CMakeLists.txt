@@ -26,7 +26,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(GGML_STATIC ON CACHE BOOL "" FORCE)
+# GGML_STATIC links the whole program with -static. ROCm ships no static libraries and ggml-hip stops on it, so the
+# HIP build keeps ggml's static archives (BUILD_SHARED_LIBS OFF) and links the ROCm libraries dynamically.
+if(INKLING_GPU STREQUAL "hip")
+  set(GGML_STATIC OFF CACHE BOOL "" FORCE)
+else()
+  set(GGML_STATIC ON CACHE BOOL "" FORCE)
+endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)           # the engine has its own thread pool
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -41,6 +47,8 @@ else()
 endif()
 if(INKLING_GPU STREQUAL "cuda")
   set(GGML_CUDA ON CACHE BOOL "" FORCE)
+  # decoding replays the same small graphs ~150 times a token: CUDA graphs cut their launches (HIP's are on by default)
+  set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 elseif(INKLING_GPU STREQUAL "hip")
   set(GGML_HIP ON CACHE BOOL "" FORCE)
 elseif(NOT INKLING_GPU STREQUAL "off")

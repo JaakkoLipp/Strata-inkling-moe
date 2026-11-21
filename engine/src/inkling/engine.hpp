@@ -83,6 +83,7 @@ public:
     EngineStats stats() const { return stats_; }
     void reset_stats() { stats_ = EngineStats{}; }
     ThreadPool& pool() { return *pool_; }
+    Gpu* gpu() const { return opt_.gpu; }   ///< the GPU of the dense weights and the expert tier, or null
 
 private:
     struct Buf;

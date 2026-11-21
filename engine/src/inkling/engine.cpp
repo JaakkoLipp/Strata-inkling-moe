@@ -36,9 +36,25 @@ static void dbg(const char* name, int il, const float* x, size_t n) {
     std::fprintf(stderr, "DBG %-24s sum=%.6f first=%.4f %.4f %.4f\n", nm, s, x[0], n > 1 ? x[1] : 0.0f, n > 2 ? x[2] : 0.0f);
 }
 
+// The physical cores: a second hardware thread of a core (SMT) shares its vector units, and on the machine measured
+// (docs/INKLING.md) all 24 hardware threads of 16 cores decoded half as fast as 16 threads.
 static int default_threads() {
-    unsigned n = std::thread::hardware_concurrency();
-    return n ? (int)n : 4;
+    const unsigned hw = std::thread::hardware_concurrency();
+#if defined(__linux__)
+    std::vector<std::string> cores;
+    for (unsigned c = 0; c < std::max(hw, 1u) * 2; ++c) {
+        std::FILE* f = std::fopen(("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/core_cpus_list").c_str(), "r");
+        if (!f) f = std::fopen(("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list").c_str(), "r");
+        if (!f) continue;
+        char buf[128] = {};
+        if (std::fgets(buf, sizeof buf, f)) cores.emplace_back(buf);
+        std::fclose(f);
+    }
+    std::sort(cores.begin(), cores.end());
+    cores.erase(std::unique(cores.begin(), cores.end()), cores.end());
+    if (!cores.empty()) return (int)cores.size();
+#endif
+    return hw ? (int)hw : 4;
 }
 
 // the scratch of one chunk; every per-token array is [T][dim]
@@ -147,16 +163,41 @@ bool Engine::rollback(const Snapshot& snap) {
     return true;
 }
 
+// MoE stage times (STRATA_INKLING_PROFILE=1 prints them at exit)
+static double g_moe_t[6], g_gpu_mm_s = 0, g_cpu_mm_s = 0;
+static uint64_t g_gpu_mm_n = 0;
+static const bool g_prof = std::getenv("STRATA_INKLING_PROFILE") != nullptr;
+struct ProfPrint {
+    ~ProfPrint() {
+        if (g_prof)
+            std::fprintf(stderr, "PROFILE moe: router %.2f s, gate_up %.2f s, situ %.2f s, quant %.2f s, down %.2f s, sum %.2f s\n",
+                         g_moe_t[0], g_moe_t[1], g_moe_t[2], g_moe_t[3], g_moe_t[4], g_moe_t[5]);
+        if (g_prof)
+            std::fprintf(stderr, "PROFILE dense: GPU %.2f s in %llu calls (%.0f us each), CPU %.2f s\n", g_gpu_mm_s,
+                         (unsigned long long)g_gpu_mm_n, g_gpu_mm_n ? 1e6 * g_gpu_mm_s / g_gpu_mm_n : 0.0, g_cpu_mm_s);
+    }
+} g_prof_print;
+
 void Engine::mm(std::initializer_list<MM> jobs, int T) {
     Gpu::Job gj[16];
     int ng = 0;
     for (const MM& j : jobs) {
         if (opt_.gpu && j.W->gpu && j.ldx == j.W->cols && j.ldy == j.W->rows && ng < 16)
             gj[ng++] = Gpu::Job{j.W, j.x, T, j.y, j.ldy};
-        else
+        else {
+            auto c0 = clk::now();
             matmul_f(*pool_, *j.W, j.x, T, j.ldx, j.y, j.ldy, b_->qa);
+            if (g_prof) g_cpu_mm_s += secs(clk::now() - c0);
+        }
     }
-    if (ng) opt_.gpu->run(gj, ng);
+    if (ng) {
+        auto g0 = clk::now();
+        opt_.gpu->run(gj, ng);
+        if (g_prof) {
+            g_gpu_mm_s += secs(clk::now() - g0);
+            ++g_gpu_mm_n;
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ building blocks
@@ -462,16 +503,6 @@ void Engine::prefetch_guess(int layer, int T) {
     store_.prefetch(layer, want.data(), (int)want.size());
 }
 
-// MoE stage times (STRATA_INKLING_PROFILE=1 prints them at exit)
-static double g_moe_t[6];
-static const bool g_prof = std::getenv("STRATA_INKLING_PROFILE") != nullptr;
-struct ProfPrint {
-    ~ProfPrint() {
-        if (g_prof)
-            std::fprintf(stderr, "PROFILE moe: router %.2f s, gate_up %.2f s, situ %.2f s, quant %.2f s, down %.2f s, sum %.2f s\n",
-                         g_moe_t[0], g_moe_t[1], g_moe_t[2], g_moe_t[3], g_moe_t[4], g_moe_t[5]);
-    }
-} g_prof_print;
 
 void Engine::moe(int layer, int T) {
     const Hparams& h = m_.hp();
@@ -535,7 +566,30 @@ void Engine::moe(int layer, int T) {
     for (int e = 0; e < NE; ++e)
         if (!by_expert[e].empty()) needed.push_back(e);
 
-    quantize_acts(b.x.data(), T, E, E, L.gate_up.type, b.qa, pool_.get());
+    // the experts in VRAM run there while the CPU computes the others (gpu.hpp); their outputs land in the same rank
+    // slots, so the sum below does not change
+    Gpu* gx = opt_.gpu && opt_.gpu->has_experts() ? opt_.gpu : nullptr;
+    bool gpu_running = false;
+    int admits_left = 0;
+    if (gx) {
+        static const int admit_cap = std::getenv("STRATA_INKLING_GPU_ADMIT") ? std::atoi(std::getenv("STRATA_INKLING_GPU_ADMIT")) : 4;
+        admits_left = admit_cap;
+        std::vector<int> eslot(NE, -1);
+        for (int e : needed) eslot[e] = gx->lookup(layer, e);
+        std::vector<int> gslot((size_t)T * K);
+        bool any = false;
+        for (size_t i = 0; i < (size_t)T * K; ++i) {
+            gslot[i] = eslot[b.ids[i]];
+            any |= gslot[i] >= 0;
+        }
+        if (any) {
+            gx->moe_begin(layer, b.x.data(), T, gslot.data());
+            gpu_running = true;
+            needed.erase(std::remove_if(needed.begin(), needed.end(), [&](int e) { return eslot[e] >= 0; }), needed.end());
+        }
+    }
+
+    if (!needed.empty()) quantize_acts(b.x.data(), T, E, E, L.gate_up.type, b.qa, pool_.get());
     lap(0);
     // a prompt's experts come in waves; with a small cache, half the pinnable slots hold the wave being computed and
     // the other half the next one, read meanwhile
@@ -547,7 +601,9 @@ void Engine::moe(int layer, int T) {
     std::vector<std::pair<size_t, int>> waves;
     bool begun = false;
     static const bool no_overlap = std::getenv("STRATA_INKLING_NO_OVERLAP") != nullptr;   // A/B: wait for all first
-    if (store_.mode() == StoreMode::Stream && (int)needed.size() <= wave_max && !no_overlap) {
+    if (needed.empty()) {
+        // every expert of this layer is on the GPU
+    } else if (store_.mode() == StoreMode::Stream && (int)needed.size() <= wave_max && !no_overlap) {
         const auto mid = std::stable_partition(needed.begin(), needed.end(), [&](int e) { return store_.ready(layer, e); });
         const int nr = (int)(mid - needed.begin()), nn = (int)needed.size();
         store_.begin(layer, needed.data(), nn);
@@ -653,9 +709,14 @@ void Engine::moe(int layer, int T) {
                 }
             });
         }
+        // the hot ones go up to VRAM while their RAM copy is pinned (a few per layer, so the copies stay cheap)
+        if (gx)
+            for (int u = 0; u < nw && admits_left > 0; ++u)
+                if (gx->want(layer, wids[u]) && gx->admit(layer, wids[u], views[u])) --admits_left;
         store_.release(layer, wids, nw);
         lap(4);
     }
+    if (gpu_running) gx->moe_end(b.dnk.data());
 
     dbg("ffn_moe_down_scaled", layer, b.dnk.data(), (size_t)T * K * E);
     // weighted sum in rank order (llama.cpp adds the experts' views one after the other)

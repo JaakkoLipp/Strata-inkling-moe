@@ -43,16 +43,19 @@ struct Args {
     std::string model, mode = "info", dump_prefix, ids_file;
     std::string experts = "auto", gpu = "auto";
     int ctx = 32768, threads = 0, chunk = 256, io_threads = 8, last = 0, prompt_len = 128, gen = 32;
-    double ram_budget = 0, expert_cache = 0;
+    double ram_budget = 0, expert_cache = 0, vram_budget = -1;
     bool direct = true, lookahead = false, embed_ram = false;
 };
 
 void usage() {
     std::fprintf(stderr,
                  "usage: strata-inkling --model FILE [--serve | --info | --dump-logits PREFIX --ids-file F | --bench]\n"
-                 "  --gpu auto|off|N    the dense weights on a GPU (auto: the first one, if this build has GPU backends)\n"
+                 "  --gpu auto|off|N    the dense weights and the hot experts on a GPU (auto: the first one, if this build\n"
+                 "                      has GPU backends)\n"
+                 "  --vram-budget GIB   VRAM the engine may use in all (default: free VRAM less 1 GiB); what the dense\n"
+                 "                      weights leave holds the most-used experts. 0: the dense weights only\n"
                  "  --ctx N             context length (default 32768)\n"
-                 "  --threads N         compute threads (default: all cores)\n"
+                 "  --threads N         compute threads (default: the physical cores)\n"
                  "  --chunk N           prompt tokens per step (default 256)\n"
                  "  --experts MODE      auto (default), resident, mmap or stream\n"
                  "  --ram-budget GIB    RAM the engine may use in all (default: available RAM less a margin)\n"
@@ -87,6 +90,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--experts") a.experts = need(i);
         else if (s == "--gpu") a.gpu = need(i);
         else if (s == "--ram-budget") a.ram_budget = std::atof(need(i));
+        else if (s == "--vram-budget") a.vram_budget = std::atof(need(i));
         else if (s == "--expert-cache") a.expert_cache = std::atof(need(i));
         else if (s == "--io-threads") a.io_threads = std::atoi(need(i));
         else if (s == "--no-direct-io") a.direct = false;
@@ -147,6 +151,24 @@ int main(int argc, char** argv) {
             if (gpu->upload(model, why)) {
                 std::fprintf(stderr, "inkling: GPU: %s, dense weights in VRAM (%.2f GiB)\n", gpu->name().c_str(),
                              gpu->weight_bytes() / 1073741824.0);
+                // the experts get what the budget leaves after the dense weights and room for the graphs (0.5 GiB)
+                const uint64_t G = 1ull << 30, reserve = G / 2;
+                uint64_t room = 0;
+                if (a.vram_budget >= 0) {
+                    const uint64_t budget = (uint64_t)(a.vram_budget * (double)G);
+                    room = budget > gpu->weight_bytes() + reserve ? budget - gpu->weight_bytes() - reserve : 0;
+                    if (gpu->total_bytes()) room = std::min(room, gpu->free_bytes() > G / 2 ? gpu->free_bytes() - G / 2 : 0);
+                } else if (gpu->total_bytes()) {
+                    room = gpu->free_bytes() > G + reserve ? gpu->free_bytes() - G - reserve : 0;
+                }
+                if (room > 0) {
+                    std::string ewhy;
+                    if (gpu->init_experts(model, room, ewhy))
+                        std::fprintf(stderr, "inkling: GPU: %d experts fit in %.2f GiB of VRAM (the most-used go there)\n",
+                                     gpu->expert_slots(), gpu->expert_bytes() / (double)G);
+                    else
+                        std::fprintf(stderr, "inkling: GPU: no experts in VRAM (%s)\n", ewhy.c_str());
+                }
             } else {
                 std::fprintf(stderr, "inkling: GPU: %s; the dense weights stay in RAM\n", why.c_str());
                 model.load_gpu_mats_to_ram();
@@ -239,6 +261,7 @@ int main(int argc, char** argv) {
                         ep.dense_s, ep.head_s);
             store->reset_stats();
             eng.reset_stats();
+            if (gpu) gpu->reset_expert_stats();
             auto t1 = clk::now();
             std::vector<int> out;
             for (int i = 0; i < a.gen; ++i) {
@@ -257,6 +280,12 @@ int main(int argc, char** argv) {
                         rate(sg), gib(sg.bytes_read), sg.bytes_read / 1048576.0 / std::max(1, a.gen), sg.stall_s,
                         (unsigned long long)sg.prefetched, (unsigned long long)sg.prefetch_used);
             std::printf("ssd (decode): %.2f GiB in %.2f s of I/O-thread time\n", gib(sg.bytes_read), sg.read_s);
+            if (gpu && gpu->has_experts()) {
+                const GpuExpertStats gs = gpu->expert_stats();
+                std::printf("vram experts (decode): %.1f%% of lookups on the GPU, %llu copied up (%.2f GiB)\n",
+                            gs.lookups ? 100.0 * gs.hits / gs.lookups : 0.0, (unsigned long long)gs.uploads,
+                            gib(gs.upload_bytes));
+            }
             std::printf("decode time: attention %.2f s, experts %.2f s, dense %.2f s, head %.2f s\n", es.attn_s, es.moe_s,
                         es.dense_s, es.head_s);
 #if !defined(_WIN32)
