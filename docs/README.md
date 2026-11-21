@@ -8,6 +8,7 @@
 | --- | --- |
 | Install or update | [Desktop app and Terminal](INSTALL.md) |
 | Choose a model and check memory | [Models and quantizations](MODELS.md) |
+| Run Inkling 2 Mini in little RAM, experts from the SSD (experimental) | [Inkling 2 Mini](INKLING.md) |
 | See which model runs on which hardware | [Model and hardware table](CAPABILITIES.md) |
 | Start from the command line | [Terminal launch](TERMINAL_LAUNCH.md) |
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |

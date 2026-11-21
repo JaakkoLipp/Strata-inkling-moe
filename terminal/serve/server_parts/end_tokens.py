@@ -14,7 +14,8 @@ def end_token_ids(tokenizer) -> set[int]:
     of the first "|", ">", "end", "of", "text" or "im" it wrote, so "Nerazim" came out as "Neraz" (#4576, and a table's first
     "|" in #4137).  Those ids are left out, and the end token the tokenizer names (special_ids "eos") ends the reply instead."""
     ids: set[int] = set()
-    for marker in (IM_END, "<|endoftext|>"):
+    # <|content_model_end_sampling|>: the end of an Inkling 2 turn (a Qwen vocabulary splits it into pieces: not counted there)
+    for marker in (IM_END, "<|endoftext|>", "<|content_model_end_sampling|>"):
         got = tokenizer.encode(marker, parse_special=True)
         if len(got) == 1:
             ids.add(int(got[0]))
