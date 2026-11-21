@@ -48,7 +48,7 @@ DEFAULT = "UD-Q4_K_XL"
 # in f16; the other 40 keep a ring of 1,024 + one prompt chunk (fixed, about 0.2 GiB).
 KV_BYTES_PER_TOKEN = 8 * 2 * 8 * 128 * 2
 RING_GIB = 40 * (1024 + 256) * 2 * 8 * 128 * 2 / 2 ** 30
-# below this much for experts the cache thrashes (measured: 1.5 GiB of UD-Q4_K_XL still answers at 82% from RAM)
+# below this much for experts the cache thrashes (measured: a 1.5 GiB cache of UD-Q4_K_XL still answers 61% of lookups from RAM)
 MIN_EXPERT_CACHE_GIB = 1.0
 OS_MARGIN_GIB = 1.0
 
@@ -76,7 +76,7 @@ def plan(size: str, ram_gib: float, context: int) -> dict:
 def recommend(ram_gib: float, context: int) -> str:
     """The size to offer first.  Streaming is what this engine is for, so the recommended UD-Q4_K_XL is offered whenever
     its expert cache gets at least a tenth of its experts (measured on UD-Q4_K_XL, docs/INKLING.md: 10% of the experts in
-    RAM answered 82% of lookups from RAM, 20% 90%, 40% 95%); below that, the largest size whose experts all fit, else the
+    RAM answered 61% of lookups from RAM, 20% 81%, 41% 90%); below that, the largest size whose experts all fit, else the
     smallest."""
     p = plan(DEFAULT, ram_gib, context)
     if p["mode"] == "ram" or p["share"] >= 0.10:

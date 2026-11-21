@@ -46,6 +46,8 @@ They are estimates; a given context may still not fit.
 - **Less memory, general use:** compare Unsloth, then [Gyro](#gyro-s-and-gyro-m-agentionai), which uses the least memory and is slower.
 - **More memory:** [Unsloth's 4 to 8 bit files](#unsloths-files-ud-iq4_xs-to-q8_0) need 72 to 136 GB for all experts in RAM.
 - **A smaller model:** [Qwen3.6-35B-A3B](#qwen36-35b-a3b), 32 to 52 GB of RAM.
+- **Very little RAM, a fast NVMe SSD:** [Inkling 2 Mini](INKLING.md) (experimental, CPU only, source checkout): its
+  17.6 GB UD-Q4_K_XL ran in 2.9 GiB of RAM with the experts read from the SSD.
 
 If RAM is short, setup can read experts from the SSD instead ([below](#will-it-fit)). That works and is much slower.
 

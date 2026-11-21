@@ -308,16 +308,44 @@ void Engine::attention(const Layer& L, int slot, int T, int p0) {
     const int extent = swa ? h.n_swa : h.rel_extent;
     const int G = nh / nkv;
     const float scale = 1.0f / std::sqrt((float)hd);
-    pool_->run((int64_t)T * nkv, 1, [&](int64_t a, int64_t bb) {
-        thread_local std::vector<float> sc, rb, vrow;
+    // a prompt's queries go in blocks of 8 per KV head: the block's keys and values are widened to f32 once, not once per
+    // query (each query's arithmetic is the same either way, so the result does not depend on the chunking)
+    const int QB = T > 1 ? 8 : 1;
+    const int nblk = (T + QB - 1) / QB;
+    pool_->run((int64_t)nblk * nkv, 1, [&](int64_t a, int64_t bb) {
+        thread_local std::vector<float> sc, rb, krow, vrow, kf, vf;
         for (int64_t job = a; job < bb; ++job) {
-            const int t = (int)(job / nkv), g = (int)(job % nkv);
+          const int blk = (int)(job / nkv), g = (int)(job % nkv);
+          const int t0 = blk * QB, t1 = std::min(T, t0 + QB);
+          const int ulo = swa ? std::max(0, p0 + t0 - h.n_swa + 1) : 0, uhi = p0 + t1 - 1, un = uhi - ulo + 1;
+          const bool widened = t1 - t0 > 1 && un <= 8192;
+          krow.resize(hd);
+          vrow.resize(hd);
+          if (widened) {
+              kf.resize((size_t)un * hd);
+              vf.resize((size_t)un * hd);
+              for (int j = ulo; j <= uhi; ++j) {
+                  const size_t row = (size_t)(swa ? j % cap : j) * kvd + (size_t)g * hd;
+                  ggml_cpu_fp16_to_fp32(K + row, &kf[(size_t)(j - ulo) * hd], hd);
+                  ggml_cpu_fp16_to_fp32(V + row, &vf[(size_t)(j - ulo) * hd], hd);
+              }
+          }
+          auto key_at = [&](int j) -> const float* {
+              if (widened) return &kf[(size_t)(j - ulo) * hd];
+              ggml_cpu_fp16_to_fp32(K + (size_t)(swa ? j % cap : j) * kvd + (size_t)g * hd, krow.data(), hd);
+              return krow.data();
+          };
+          auto value_at = [&](int j) -> const float* {
+              if (widened) return &vf[(size_t)(j - ulo) * hd];
+              ggml_cpu_fp16_to_fp32(V + (size_t)(swa ? j % cap : j) * kvd + (size_t)g * hd, vrow.data(), hd);
+              return vrow.data();
+          };
+          for (int t = t0; t < t1; ++t) {
             const int p = p0 + t;
             const int jlo = swa ? std::max(0, p - h.n_swa + 1) : 0;
             const int n = p - jlo + 1;
             sc.resize((size_t)G * n);
             rb.resize((size_t)G * extent);
-            vrow.resize(hd);
             for (int gi = 0; gi < G; ++gi) {
                 const int hh = g * G + gi;
                 const float* rv = &b.r[(size_t)t * nrel * nh + (size_t)hh * nrel];
@@ -333,10 +361,10 @@ void Engine::attention(const Layer& L, int slot, int T, int p0) {
             // prompt path does the same; its one-token path rounds q to f16 instead)
             for (int jj = 0; jj < n; ++jj) {
                 const int j = jlo + jj;
-                ggml_cpu_fp16_to_fp32(K + (size_t)(swa ? j % cap : j) * kvd + (size_t)g * hd, vrow.data(), hd);
+                const float* kr = key_at(j);
                 const int d = p - j;
                 for (int gi = 0; gi < G; ++gi) {
-                    const float s = dot_f32(vrow.data(), &b.q[(size_t)t * qd + (size_t)(g * G + gi) * hd], hd);
+                    const float s = dot_f32(kr, &b.q[(size_t)t * qd + (size_t)(g * G + gi) * hd], hd);
                     // llama.cpp folds the bias into the mask, which is added after the scale (build_attn, rel_pos)
                     sc[(size_t)gi * n + jj] = s * scale + (d < extent ? rb[(size_t)gi * extent + d] : 0.0f);
                 }
@@ -373,14 +401,14 @@ void Engine::attention(const Layer& L, int slot, int T, int p0) {
                 std::fill(outs[gi], outs[gi] + hd, 0.0f);
             }
             for (int jj = 0; jj < n; ++jj) {
-                const int j = jlo + jj;
-                ggml_cpu_fp16_to_fp32(V + (size_t)(swa ? j % cap : j) * kvd + (size_t)g * hd, vrow.data(), hd);
+                const float* vr = value_at(jlo + jj);
                 for (int gi = 0; gi < G; ++gi) {
-                    const float p = sc[(size_t)gi * n + jj];
+                    const float pw = sc[(size_t)gi * n + jj];
                     float* o = outs[gi];
-                    for (int i = 0; i < hd; ++i) o[i] += p * vrow[i];
+                    for (int i = 0; i < hd; ++i) o[i] += pw * vr[i];
                 }
             }
+          }
         }
     });
 
@@ -457,6 +485,13 @@ void Engine::moe(int layer, int T) {
         std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int a, int c) {
             return sel[a] > sel[c] || (sel[a] == sel[c] && a < c);
         });
+        if (g_debug) {
+            static const int dt = std::getenv("STRATA_INKLING_DEBUG_TOKEN") ? std::atoi(std::getenv("STRATA_INKLING_DEBUG_TOKEN")) : 0;
+            if (t == dt) {
+                std::partial_sort(idx.begin() + K, idx.begin() + K + 1, idx.end(), [&](int a, int c) { return sel[a] > sel[c]; });
+                std::fprintf(stderr, "DBG margin-%d: 8th %d %.7f 9th %d %.7f\n", layer, idx[K - 1], sel[idx[K - 1]], idx[K], sel[idx[K]]);
+            }
+        }
         float sum = 0.0f;
         for (int k = 0; k < K; ++k) {
             b.ids[(size_t)t * K + k] = idx[k];
@@ -470,9 +505,13 @@ void Engine::moe(int layer, int T) {
     dbg("ffn_moe_logits", layer, b.logits.data(), (size_t)T * NE);
     dbg("ffn_moe_weights_scaled", layer, b.wts.data(), (size_t)T * K);
     if (g_debug) {
-        std::fprintf(stderr, "DBG topk-%d:", layer);
-        for (int k = 0; k < K; ++k) std::fprintf(stderr, " %d", b.ids[k]);
-        std::fprintf(stderr, "\n");
+        // STRATA_INKLING_DEBUG_TOKEN=t: the experts of token t of the chunk (default 0)
+        static const int dt = std::getenv("STRATA_INKLING_DEBUG_TOKEN") ? std::atoi(std::getenv("STRATA_INKLING_DEBUG_TOKEN")) : 0;
+        if (dt < T) {
+            std::fprintf(stderr, "DBG topk-%d:", layer);
+            for (int k = 0; k < K; ++k) std::fprintf(stderr, " %d", b.ids[(size_t)dt * K + k]);
+            std::fprintf(stderr, "\n");
+        }
     }
     // the experts this chunk needs, each with the (token, rank) pairs routed to it
     std::vector<std::vector<int>> by_expert(NE);

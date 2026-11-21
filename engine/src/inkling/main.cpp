@@ -16,6 +16,10 @@
 
 #include "ggml.h"
 
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -235,6 +239,18 @@ int main(int argc, char** argv) {
             std::printf("ssd (decode): %.2f GiB in %.2f s of I/O-thread time\n", gib(sg.bytes_read), sg.read_s);
             std::printf("decode time: attention %.2f s, experts %.2f s, dense %.2f s, head %.2f s\n", es.attn_s, es.moe_s,
                         es.dense_s, es.head_s);
+#if !defined(_WIN32)
+            {
+                struct rusage ru {};
+                getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+                const double peak = ru.ru_maxrss / 1073741824.0;   // bytes on macOS
+#else
+                const double peak = ru.ru_maxrss / 1048576.0;      // KiB on Linux
+#endif
+                std::printf("peak RAM (resident): %.2f GiB\n", peak);
+            }
+#endif
             std::printf("tokens:");
             for (int t : out) std::printf(" %d", t);
             std::printf("\n");
