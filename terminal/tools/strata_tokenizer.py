@@ -101,6 +101,23 @@ QWEN2_PATTERN = (
 )
 
 
+# The `inkling2` pre-tokenizer (thinkingmachines/Inkling-2-Mini; llama.cpp maps the name to LLAMA_VOCAB_PRE_TYPE_GPT4O, the o200k
+# split, ggml-org/llama.cpp src/llama-vocab.cpp at #32704).  This is the tokenizer.json original that llama.cpp quotes above its
+# own spelling (llama.cpp rewrites the \p{Lu}/\p{Ll} classes as lookaheads because its regex engine lacks them; the `regex`
+# module has them).  Words keep their case runs (an upper-case run, then lower-case letters, with the English contractions
+# attached), digits go in runs of at most three, and a punctuation run takes its trailing newlines and slashes.  Checked
+# against llama-tokenize on the GGUF (tools/inkling/tokenizer_check.py).
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -125,7 +142,8 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", or
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3",
+    "gpt4o" (Inkling 2's "inkling2"), or
     None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
@@ -134,6 +152,8 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "qwen2"
     if p.startswith("deepseek"):
         return "deepseek3"
+    if p == "inkling2":
+        return "gpt4o"
     return None
 
 
@@ -169,6 +189,9 @@ class Tokenizer:
             self._split = lambda text: _sequence_findall(seq, text)
         elif pre_tokenizer_kind(pre) == "qwen2":
             self._re = regex.compile(QWEN2_PATTERN)
+            self._split = self._re.findall
+        elif pre_tokenizer_kind(pre) == "gpt4o":
+            self._re = regex.compile(GPT4O_PATTERN)
             self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
@@ -526,8 +549,10 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": GPT4O_PATTERN if pre_tokenizer_kind(tk.pre) == "gpt4o" else QWEN35_PATTERN,
+        "pre_pattern_source": ("tokenizer.json of thinkingmachines/Inkling-2-Mini (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O)"
+                               if pre_tokenizer_kind(tk.pre) == "gpt4o" else
+                               ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

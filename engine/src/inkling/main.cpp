@@ -75,7 +75,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--dump-logits") { a.mode = "dump"; a.dump_prefix = need(i); }
         else if (s == "--ids-file") a.ids_file = need(i);
         else if (s == "--last") a.last = std::atoi(need(i));
-        else if (s == "--ctx" || s == "--context") a.ctx = std::atoi(need(i));
+        else if (s == "--ctx" || s == "--context" || s == "--max-context") a.ctx = std::atoi(need(i));
         else if (s == "--threads" || s == "-t") a.threads = std::atoi(need(i));
         else if (s == "--chunk" || s == "--prefill") a.chunk = std::atoi(need(i));
         else if (s == "--experts") a.experts = need(i);
@@ -89,7 +89,15 @@ Args parse(int argc, char** argv) {
         else if (s == "--prompt-len") a.prompt_len = std::atoi(need(i));
         else if (s == "--gen") a.gen = std::atoi(need(i));
         else if (s == "--help" || s == "-h") { usage(); std::exit(0); }
-        else throw std::runtime_error("unknown option " + s + " (--help lists them)");
+        else if (s.rfind("--", 0) == 0) {
+            // an option the Strata server writes for its other engines (drafting, batching, ...): noted and skipped,
+            // with its value when one follows, so a shared run config does not stop this engine from starting
+            std::string v = i + 1 < argc && argv[i + 1][0] != '-' ? argv[++i] : "";
+            std::fprintf(stderr, "inkling: note: ignoring %s%s%s (not an option of this engine)\n", s.c_str(),
+                         v.empty() ? "" : " ", v.c_str());
+        } else {
+            throw std::runtime_error("unexpected argument " + s + " (--help lists the options)");
+        }
     }
     if (a.model.empty()) throw std::runtime_error("--model is required");
     return a;
